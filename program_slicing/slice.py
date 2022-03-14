@@ -17,7 +17,8 @@ varname = sys.argv[3]  # the variable name argument to the slicer
 # what's this AST thing look like?
 code = open(filename).read()
 tree = ast.parse(code)
-astpretty.pprint(tree)
+# To view the pretty printed AST, uncomment this line.
+# astpretty.pprint(tree)
 
 # it's convenient for us to keep track of all the CFG nodes that exist
 # let's provide a way of registering them and keeping track
@@ -60,6 +61,8 @@ class CFGNode(dict):
         self.update_children(parents)  # requires self.rid
         self.children = []
         self.calls = []
+        self.relevant_set = set()
+        self.control_set = set()
 
     def i(self):
         return str(self.rid)
@@ -102,6 +105,13 @@ class CFGNode(dict):
     def add_parents(self, ps):
         for p in ps:
             self.add_parent(p)
+
+    def update_relevant_set(self, relevant_set):
+        self.relevant_set = relevant_set
+
+    def update_control_set(self, pred):
+        if pred not in self.control_set:
+            self.control_set.add(pred)
 
     def source(self):
         return astor.to_source(self.ast_node).strip()
@@ -187,6 +197,42 @@ class PyCFG:
         _test_node.add_parents(p1)
 
         return test_node  # return list of exit CFGNodes
+
+    def on_if(self, node, myparents):
+        # For an If node, the earliest parent is the node.test, which represents
+        # the condition guarding execution of the if block.
+        _test_node = CFGNode(
+            parents=myparents,
+            ast=ast.parse("_if: %s" % astor.to_source(node.test).strip()).body[0],
+        )
+
+        # Copy the source location from node.test to our newly created _test_node.
+        ast.copy_location(_test_node.ast_node, node.test)
+        test_node = self.walk(node.test, [_test_node])
+
+        # Ensure test_node is a list with a single node.
+        assert len(test_node) == 1
+
+        # Evaluate the body, one line at a time.
+        p1 = test_node
+        for n in node.body:
+            p1 = self.walk(n, p1)
+
+            # Add the lineno of the test node to the control set.
+            for body_node in p1:
+                body_node.update_control_set(node.test.lineno)
+
+        # Evaluate the orelse, one line at a time.
+        p2 = test_node
+        for n in node.orelse:
+            p2 = self.walk(n, p2)
+
+            # Add the lineno of the test node to the control set.
+            for orelse_node in p2:
+                orelse_node.update_control_set(node.test.lineno)
+
+        # Return the list of exit CFGNodes.
+        return p1 + p2
 
     def on_binop(self, node, myparents):
         left = self.walk(node.left, myparents)
@@ -307,7 +353,9 @@ def print_lines_in_slice(lines_in_slice):
 def print_slice(lines_in_slice, nodes):
     print(lines_in_slice)
     for line in lines_in_slice:
-        print(nodes[line].source())
+        for node in nodes.values():
+            if node.lineno() == line:
+                print(node.source())
 
 
 def collect_references(ast_node):
@@ -317,6 +365,65 @@ def collect_references(ast_node):
         return []
     elif type(ast_node) == ast.BinOp:
         return collect_references(ast_node.left) + collect_references(ast_node.right)
+    elif type(ast_node) == ast.Assign:
+        return collect_references(ast_node.value)
+    elif type(ast_node) == ast.AnnAssign:
+        return collect_references(ast_node.annotation)
+    elif type(ast_node) == ast.If:
+        return collect_references(ast_node.test)
+
+
+def build_slice(node, vars):
+    # Store all lines to be included in the slice in a set.
+    # This ensures we don't duplicate lines in the slice even
+    # if DFS visits the same nodes twice.
+    lines_in_slice = set()
+
+    # Initialize the relevant set of the currently observed node.
+    start_loc = node
+    start_loc.update_relevant_set(vars)
+
+    # Initialize a stack for traversing the CFG using DFS.
+    stack = [start_loc]
+
+    while len(stack) > 0:
+        current_loc = stack.pop()
+        parents = current_loc.parents
+
+        for parent in parents:
+            # Define sets to hold def(m) and ref(m).
+            def_m = set()
+            ref_m = set()
+
+            # Add all variables defined at m to def(m).
+            if isinstance(parent.ast_node, ast.Assign):
+                for target in parent.ast_node.targets:
+                    def_m.add(target.id)
+
+            # Define relevant_m to be the set difference of relevant_n and def_m.
+            relevant_m = current_loc.relevant_set.difference(def_m)
+
+            if current_loc.relevant_set.intersection(def_m) != set():
+                # Add all referenced variables to ref(m).
+                ref_m = set(collect_references(parent.ast_node))
+                relevant_m = relevant_m.union(ref_m)
+
+                # Add line m to the slice.
+                lines_in_slice.add(parent.lineno())
+
+            if parent.lineno() in current_loc.control_set:
+                # Add line m to the slice.
+                lines_in_slice.add(parent.lineno())
+
+                # Get all variables referenced in the control set.
+                ref_c = set(collect_references(parent.ast_node))
+
+                lines_in_slice = lines_in_slice.union(build_slice(parent, ref_c))
+
+            parent.update_relevant_set(relevant_m)
+            stack.append(parent)
+
+    return lines_in_slice
 
 
 def slice(nodes, linenum, varname):
@@ -325,55 +432,26 @@ def slice(nodes, linenum, varname):
     # for grading purposes, please
     #    (1) call the print_slice function on the list of line numbers
     #    (2) remove other print statements
-    lines_in_slice = []
 
-    # Instantiate the relevant set R as the empty set.
-    relevant = set()
+    # Find the starting node based on the line number.
+    start_loc = None
 
-    # Insert varname into the relevant set.
-    relevant.add(varname)
+    for node in nodes.values():
+        if node.lineno() == linenum:
+            start_loc = node
 
-    # Get the starting node based on the input linenum.
-    # Track the current node as we traverse up the CFG.
-    start_loc = nodes[linenum]
-    current_loc = start_loc
+    if start_loc is None:
+        raise f"linenum {linenum} does not correspond to any AST node."
 
-    while len(relevant) != 0 and current_loc.source() != "start":
-        parents = current_loc.parents
+    lines_in_slice = build_slice(start_loc, set(varname))
 
-        for parent in parents:
-            # Define sets to hold def(m) and ref(m) for each parent statement.
-            def_m = set()
-            ref_m = set()
-
-            if isinstance(parent.ast_node, ast.Assign):
-                # Add all defined variables to def(m).
-                for target in parent.ast_node.targets:
-                    def_m.add(target.id)
-
-                # Define relevant_m to be the set difference relevant \ def_m.
-                relevant_m = relevant.difference(def_m)
-
-                # Find all elements in def_m that are in relevant.
-                intersect = relevant.intersection(def_m)
-
-                # If def_m in relevant...
-                if len(intersect) > 0:
-                    # Add all referenced variables to ref(m).
-                    ref_m = set(collect_references(parent.ast_node.value))
-                    relevant_m = relevant_m.union(ref_m)
-
-                    # Add m to the slice.
-                    lines_in_slice.append(parent.lineno())
-
-                # Update the relevant set.
-                relevant = relevant_m
-
-            # Update the current_loc to point to the parent node.
-            current_loc = parent
-
-    print_slice(lines_in_slice, nodes)
+    print_lines_in_slice(list(lines_in_slice))
 
 
 nodes = gen_cfg(code)
 slice(nodes, linenum, varname)
+
+# To print out a graph representation of the CFG using graphviz,
+# uncomment these lines.
+# graph = to_graph(nodes)
+# graph.render("cfg.gv", view="True")
