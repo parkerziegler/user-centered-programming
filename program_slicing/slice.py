@@ -390,6 +390,9 @@ def build_slice(node, vars):
         current_loc = stack.pop()
         parents = current_loc.parents
 
+        if current_loc.relevant_set == set() or current_loc.source() == "start":
+            break
+
         for parent in parents:
             # Define sets to hold def(m) and ref(m).
             def_m = set()
